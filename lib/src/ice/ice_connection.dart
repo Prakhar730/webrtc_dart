@@ -564,7 +564,15 @@ class IceConnectionImpl implements IceConnection {
       return;
     }
 
-    final stunAddress = stunAddresses.first;
+    final v4 = stunAddresses
+      .where((a) => a.type == InternetAddressType.IPv4)
+      .toList();
+    if (v4.isEmpty) {
+    _log.fine(' STUN: No IPv4 address for $stunHost, skipping srflx gathering');
+    return;
+    }
+    final stunAddress = v4.first;
+
     _log.fine(' STUN: Using address ${stunAddress.address}');
 
     // Create a copy to avoid concurrent modification
@@ -2341,11 +2349,28 @@ class IceConnectionImpl implements IceConnection {
         '[ICE] Updated options: stunServer=${options.stunServer}, turnServer=${options.turnServer}');
   }
 
+  // PATCH_ASYNC
+  void _asyncResend(RawDatagramSocket socket, Uint8List data, InternetAddress address, int port) {
+    () async {
+      for (var r = 0; r < 200; r++) {
+        await Future.delayed(const Duration(milliseconds: 10));
+        try {
+          if (socket.send(data, address, port) > 0) { _log.warning('[ICE] PATCH_ASYNC_OK after ${(r + 1) * 10}ms to $address:$port'); return; }
+        } catch (_) { return; }
+      }
+      _log.warning('[ICE] PATCH_ASYNC_GIVEUP to $address:$port');
+    }();
+  }
   /// Helper to send datagram with error handling.
   /// Returns true if send succeeded, false if it failed (e.g., no route to host).
   bool _trySendDatagram(RawDatagramSocket socket, Uint8List data,
       InternetAddress address, int port) {
     final localAddr = socket.address;
+    if (localAddr.type != address.type) {
+       _log.fine('[ICE] Skipping send: socket family ${localAddr.type} != '
+      'destination family ${address.type} ($address)');
+  return false;
+    }
 
     // Skip IPv6 ULA/link-local addresses - these typically can't route externally
     // and attempting to send often fails. ULA = fd00::/8, fc00::/8; link-local = fe80::/10
@@ -2362,7 +2387,9 @@ class IceConnectionImpl implements IceConnection {
     }
 
     try {
-      socket.send(data, address, port);
+      var sent = socket.send(data, address, port);
+      if (sent == 0) { _log.warning('[ICE] PATCH_SEND0 first send returned 0 to $address:$port - retrying'); for (var r = 0; sent == 0 && r < 50; r++) { sent = socket.send(data, address, port); } }
+      if (sent == 0) { _log.warning('[ICE] PATCH_SEND0_FAIL datagram not sent to $address:$port - async resend'); _asyncResend(socket, data, address, port); return true; }
       return true;
     } on SocketException catch (e) {
       _log.fine('[ICE] Socket send failed (SocketException): $e');
